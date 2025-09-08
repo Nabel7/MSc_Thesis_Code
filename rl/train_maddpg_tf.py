@@ -12,7 +12,7 @@ def train(env, episodes=200, steps_per_ep=288, cfg: MADDPGConfig = MADDPGConfig(
         Number of episodes to roll out. Each episode samples a *contiguous* window.
     steps_per_ep : int
         Steps per episode (should match env.episode_len for full windows, but can be smaller).
-    cfg : DDPGConfig
+    cfg : DDPGConfig 
         Hyperparameters for the DDPG agent (+ PER settings).
 
     Returns

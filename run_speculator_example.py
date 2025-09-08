@@ -76,5 +76,5 @@ cfg = DQNConfig(
     dueling=True,
     double=True,
 )
-agent, returns = train(env, episodes=10, steps_per_ep=96, cfg=cfg, warmup_steps=2000)
+agent, returns = train(env, episodes=10, steps_per_ep=96, cfg=cfg, warmup_steps=4000)
 print("Returns:", returns)

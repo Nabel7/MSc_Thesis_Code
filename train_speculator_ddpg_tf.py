@@ -8,7 +8,7 @@ import numpy as np
 from rl.ddpg_tf import DDPGAgent, DDPGConfig
 
 def train(env, episodes=200, steps_per_ep=None, cfg: DDPGConfig = DDPGConfig(),
-          warmup_steps=5000, updates_per_step=1, debug_first_n=5):
+          warmup_steps=1000, updates_per_step=1, debug_first_n=5):
     
     # Shapes and bounds
     obs_dim = env.observation_space.shape[0]

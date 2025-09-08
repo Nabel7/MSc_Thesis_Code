@@ -1,76 +1,57 @@
-# train_speculator_dqn_tf.py
+# train_speeculator_dqn_tf.py
 from dataclasses import asdict
 import numpy as np
-import os
-
+from typing import Optional
 from rl.dqn_tf import DQNAgent, DQNConfig
+from utils.logger import CSVLogger, EpisodeLog
 
-# Optional CSV logging (safe fallback if utils/logger.py isn't present)
-try:
-    from utils.logger import CSVLogger, EpisodeLog  # your helper
-except Exception:
-    class EpisodeLog:
-        def __init__(self, **kwargs): self.__dict__.update(kwargs)
-    class CSVLogger:
-        def __init__(self, episode_csv=None, step_csv=None): pass
-        def log_step(self, **kwargs): pass
-        def log_episode(self, *args, **kwargs): pass
-
-
-def train(env_train, env_val, episodes=30, steps_per_ep=96,
-          cfg: DQNConfig = DQNConfig(), warmup_steps=2000):
+def train(env_train, env_val,
+          episodes: int = 30, steps_per_ep: int = 96,
+          cfg: DQNConfig = DQNConfig(),
+          warmup_steps: int = 2000,
+          logger: Optional[CSVLogger] = None,
+          run_id: str = ""):
     """
-    Train loop for discrete Δ-action DQN (dueling/double + PER).
-    - Fills replay during warm-up with random actions.
-    - Calls agent.update() only after warm-up AND when replay has >= batch_size items.
-    - Logs per-step (optional) and per-episode summaries.
+    Discrete-Δ DQN training loop (dueling/double, PER).
+    - Warmup with random actions then epsilon-greedy via agent.select_action.
+    - Update only when replay has >= batch_size.
+    - Logs per-step (optional) + per-episode summaries compatible with CSVLogger.
     """
     agent = DQNAgent(env_train.observation_space.shape[0], cfg)
     print("DQN config:", asdict(cfg))
 
+    if logger is None:
+        logger = CSVLogger("logs/spec_dqn_episodes.csv", "logs/spec_dqn_steps.csv")
+
     returns = []
     global_steps = 0
 
-    # --- logging set-up (non-blocking) ---
-    os.makedirs("logs", exist_ok=True)
-    logger = CSVLogger(
-        episode_csv="logs/spec_dqn_episodes.csv",
-        step_csv="logs/spec_dqn_steps.csv"   # comment out if you don’t want per-step CSV
-    )
+    print(f"[info] warmup_steps={warmup_steps}, batch_size={cfg.batch_size}, buffer_size={cfg.buffer_size}")
 
     for ep in range(1, episodes + 1):
         obs = env_train.reset()
         ep_ret = 0.0
         clears = {0: 0, 1: 0}
         seen   = {0: 0, 1: 0}
-        last_update = {}  # keep the last non-empty update logs
-
-        # Helpful: show when training will actually start
-        if ep == 1:
-            print(f"[info] warmup_steps={warmup_steps}, batch_size={agent.cfg.batch_size}, "
-                  f"buffer_size={agent.cfg.buffer_size}")
+        last_update = {}
 
         for t in range(steps_per_ep):
-            # ---- action selection (warm-up: random; else: epsilon-greedy policy) ----
+            # action
             if global_steps < warmup_steps:
                 a_idx = np.random.randint(cfg.num_bins)
-                delta = agent.delta_values[a_idx]
+                delta = float(np.linspace(-cfg.delta_max, cfg.delta_max, cfg.num_bins, dtype=np.float32)[a_idx])
             else:
                 a_idx, delta = agent.select_action(obs, explore=True)
 
-            # ---- environment step ----
             nxt, rew, done, info = env_train.step([delta])
 
-            # ---- store transition ALWAYS (including warm-up) ----
+            # store & maybe update
             agent.store((obs, a_idx, float(rew), nxt, bool(done)))
+            if (global_steps >= warmup_steps) and (len(agent.buffer) >= cfg.batch_size):
+                upd = agent.update() or {}
+                if upd: last_update = upd
 
-            # ---- update ONLY when ready: after warm-up and enough samples in replay ----
-            if (global_steps >= warmup_steps) and (len(agent.buffer) >= agent.cfg.batch_size):
-                step_logs = agent.update() or {}
-                if step_logs:
-                    last_update = step_logs  # keep latest loss/eps/beta for episode summary
-
-            # ---- optional per-step logging (robust to missing keys) ----
+            # per-step logging
             try:
                 logger.log_step(
                     split="train", episode=ep, t=t,
@@ -85,25 +66,9 @@ def train(env_train, env_val, episodes=30, steps_per_ep=96,
                     reward=float(rew),
                 )
             except Exception:
-                pass  # never let logging crash training
+                pass
 
-            # small debug print for first few steps
-            if t < 5:
-                try:
-                    print(
-                        f"[dbg] DAM={float(info.get('DAM', np.nan)):.2f} "
-                        f"BM={float(info.get('BM', np.nan)):.2f} "
-                        f"ref={float(info.get('ref', np.nan)):.2f} "
-                        f"side={int(info.get('side', -1))} "
-                        f"delta={float(info.get('delta', np.nan)):.2f} "
-                        f"limit={float(info.get('limit', np.nan)):.2f} "
-                        f"cleared={bool(info.get('cleared', False))} "
-                        f"reward={float(rew):.3f}"
-                    )
-                except Exception:
-                    pass
-
-            # ---- bookkeeping ----
+            # book-keeping
             ep_ret += float(rew)
             s = int(info.get("side", 0))
             seen[s] = seen.get(s, 0) + 1
@@ -112,26 +77,23 @@ def train(env_train, env_val, episodes=30, steps_per_ep=96,
 
             obs = nxt
             global_steps += 1
-
             if done:
                 break
 
-        # episode summary
         cr_buy  = 100.0 * (clears.get(1, 0) / max(1, seen.get(1, 0)))
         cr_sell = 100.0 * (clears.get(0, 0) / max(1, seen.get(0, 0)))
         returns.append(ep_ret)
+
         print(
             f"Episode {ep:03d} | Return {ep_ret:.3f} | "
             f"clear_rate(buy)={cr_buy:.2f}% clear_rate(sell)={cr_sell:.2f}% | "
             f"last_update: {last_update}"
         )
 
-        # episode-level TRAIN log
+        # episode TRAIN CSV
         try:
             logger.log_episode(EpisodeLog(
-                split="train",
-                episode=ep,
-                steps=t + 1,
+                split="train", episode=ep, steps=t + 1,
                 ep_return=float(ep_ret),
                 clear_rate_buy=float(cr_buy),
                 clear_rate_sell=float(cr_sell),
@@ -142,29 +104,38 @@ def train(env_train, env_val, episodes=30, steps_per_ep=96,
         except Exception:
             pass
 
-        # ---- quick validation probe (no exploration) ----
+        # quick VAL (greedy)
         v_obs = env_val.reset()
         v_ret = 0.0
         for t in range(steps_per_ep):
             a_idx, delta = agent.select_action(v_obs, explore=False)
-            v_obs, r, d, _ = env_val.step([delta])
+            v_obs, r, d, v_info = env_val.step([delta])
             v_ret += float(r)
-            if d:
-                break
+            try:
+                logger.log_step(
+                    split="val", episode=ep, t=t,
+                    DAM=float(v_info.get("DAM", np.nan)),
+                    BM=float(v_info.get("BM", np.nan)),
+                    ref=float(v_info.get("ref", np.nan)),
+                    side=int(v_info.get("side", -1)),
+                    q=float(v_info.get("q", np.nan)),
+                    delta=float(v_info.get("delta", np.nan)),
+                    limit=float(v_info.get("limit", np.nan)),
+                    cleared=bool(v_info.get("cleared", False)),
+                    reward=float(r),
+                )
+            except Exception:
+                pass
+            if d: break
         print(f"  [VAL] episode return: {v_ret:.3f}")
 
-        # episode-level VAL log
         try:
             logger.log_episode(EpisodeLog(
-                split="val",
-                episode=ep,
-                steps=t + 1,
+                split="val", episode=ep, steps=t + 1,
                 ep_return=float(v_ret),
                 clear_rate_buy=np.nan,
                 clear_rate_sell=np.nan,
-                loss=np.nan,
-                eps=np.nan,
-                beta=np.nan,
+                loss=np.nan, eps=np.nan, beta=np.nan,
             ))
         except Exception:
             pass
