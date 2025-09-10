@@ -37,8 +37,8 @@ class EnvConfig:
     normalize_features: bool = True
     add_time_features: bool = True
     time_col: Optional[str] = "DeliveryPeriod"  # try to use this if present
-    reward_scale: float = 1e-3          # <-- add
-    reward_clip: float = 5_000.0        # <-- add (clip € before scaling)
+    reward_scale: float = 1e-4          # <-- add
+    reward_clip: float = 50_000.0        # <-- add (clip € before scaling)
 
 class ISEMGeneratorEnv:
     """
@@ -54,6 +54,7 @@ class ISEMGeneratorEnv:
         plant: PlantParams = PlantParams(),
         costs: CostParams = CostParams(),
         cfg: EnvConfig = EnvConfig(),
+        var_cost_col: Optional[str] = None,   
     ):
         self.csv_path = str(csv_path)
         self.price_col = price_col
@@ -61,9 +62,18 @@ class ISEMGeneratorEnv:
         self.plant = plant
         self.costs = costs
         self.cfg = cfg
+        self.var_cost_col = var_cost_col   
 
         # ---- Load & time parsing ----
         self.df = pd.read_csv(self.csv_path)
+
+         # If a dynamic variable-cost column was requested, validate it exists
+        if self.var_cost_col is not None and self.var_cost_col not in self.df.columns:
+            raise ValueError(
+                f"var_cost_col '{self.var_cost_col}' not found in {self.csv_path}"
+            )
+
+
         self.time = None
         tcol = cfg.time_col if (cfg.time_col and cfg.time_col in self.df.columns) else None
         if tcol is None:
@@ -192,18 +202,26 @@ class ISEMGeneratorEnv:
         price = float(self.price[self.t])
         dt = self.cfg.dt_hours
 
-        revenue = price * P * dt
-        var_cost = self.costs.variable_cost_per_MWh * P * dt
-        no_load = (self.plant.no_load_cost_per_hour * dt) if self.on and P > 0 else 0.0
-        startup = self.plant.start_cost if started else 0.0
-        ramp_cost = self.plant.ramp_cost_per_MW * abs(P - self.P_prev)
+        # --- dynamic or constant variable cost rate ---
+        if self.var_cost_col is not None:
+            var_cost_rate = float(self.df[self.var_cost_col].iloc[self.t])  # €/MWh from CSV
+        else:
+            var_cost_rate = float(self.costs.variable_cost_per_MWh)
+
+        revenue  = price * P * dt
+        var_cost = var_cost_rate * P * dt
+        no_load  = (self.plant.no_load_cost_per_hour * dt) if self.on and P > 0 else 0.0
+        startup  = self.plant.start_cost if started else 0.0
+        ramp_cost= self.plant.ramp_cost_per_MW * abs(P - self.P_prev)
+
         profit = revenue - var_cost - no_load - startup - ramp_cost
 
         info = dict(
-            price=price, P=P, P_cmd=P_cmd, on=int(self.on), started=int(started), shut=int(shut),
-            revenue=revenue, var_cost=var_cost, no_load=no_load,
-            startup=startup, ramp_cost=ramp_cost, profit=profit
-        )
+    price=price, P=P, P_cmd=P_cmd, on=int(self.on), started=int(started), shut=int(shut),
+    revenue=revenue, var_cost=var_cost, var_cost_rate=var_cost_rate,  # <--- add this line if you like
+    no_load=no_load, startup=startup, ramp_cost=ramp_cost, profit=profit
+)
+
 
         profit_clamped = float(np.clip(profit, -self.cfg.reward_clip, self.cfg.reward_clip))
         reward = profit_clamped * self.cfg.reward_scale

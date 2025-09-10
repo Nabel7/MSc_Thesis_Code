@@ -7,31 +7,31 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-from envs.generator_env import ISEMGeneratorEnv, PlantParams, CostParams, EnvConfig
-from rl.ddpg_tf import DDPGAgent, DDPGConfig  # reuse your existing TF2 agent
+from envs.generator_env import ISEMGeneratorEnv
+from rl.ddpg_tf import DDPGAgent, DDPGConfig
 
 def ensure_dir(p: Path):
     p.mkdir(parents=True, exist_ok=True)
 
-def _rollout_eval(env, agent, episodes: int, steps_per_ep: int):
-    """Evaluate the current policy with NO parameter updates."""
+def _rollout_eval(env: ISEMGeneratorEnv, agent: DDPGAgent, episodes: int, steps_per_ep: int):
+    """Evaluate the current policy with NO parameter updates, NO exploration noise."""
     returns, cap_factors = [], []
     for _ in range(episodes):
         o = env.reset()
-        # If your agent exposes a noise reset, do it; otherwise it's fine.
         if hasattr(agent, "reset_noise"):
             agent.reset_noise()
         ret = 0.0
         cap_sum = 0.0
         for t in range(steps_per_ep):
-            a = agent.select_action(o)  # deterministic if your agent uses 0 noise in eval; otherwise stochastic
+            a = agent.select_action(o, explore=False)  # <- deterministic eval
             o, r, d, info = env.step(a)
             ret += r
             cap_sum += info["P"]
             if d:
                 break
         cap_factor = cap_sum / (steps_per_ep * env.plant.P_max)
-        returns.append(ret); cap_factors.append(cap_factor)
+        returns.append(ret)
+        cap_factors.append(cap_factor)
     return float(np.mean(returns)), float(np.mean(cap_factors))
 
 def train(
@@ -41,7 +41,7 @@ def train(
     cfg: DDPGConfig = DDPGConfig(),
     warmup_steps: int = 1_000,
     log_dir: str | Path | None = None,
-    # --- new ---
+    # optional eval envs
     env_val: ISEMGeneratorEnv | None = None,
     env_test: ISEMGeneratorEnv | None = None,
     eval_val_eps: int = 0,
@@ -50,7 +50,6 @@ def train(
     eval_every: int = 10,
 ):
     # ---- setup ----
-    # robustly get obs_dim (works with wrappers)
     try:
         obs_dim = env.obs_dim
     except AttributeError:
@@ -59,7 +58,7 @@ def train(
     act_low, act_high = env.action_low, env.action_high
     agent = DDPGAgent(obs_dim=obs_dim, act_dim=1, act_low=act_low, act_high=act_high, cfg=cfg)
 
-    # logging setup
+    # logging
     run_dir = None
     eval_writer = None
     if log_dir:
@@ -68,11 +67,10 @@ def train(
         steps_csv = open(run_dir / "steps.csv", "w", newline="")
         steps_writer = csv.writer(steps_csv)
         steps_writer.writerow([
-            "episode","t","reward","price","P","P_cmd","on","started",
+            "episode","t","profit","price","P","P_cmd","on","started",
             "revenue","var_cost","no_load","startup","ramp_cost"
         ])
         eps_rows = []
-        # new: eval.csv
         eval_csv = open(run_dir / "eval.csv", "w", newline="")
         eval_writer = csv.writer(eval_csv)
         eval_writer.writerow(["at_episode","split","mean_return","mean_cap_factor"])
@@ -95,23 +93,25 @@ def train(
         cap_sum = 0.0
 
         steps_this_ep = env.cfg.episode_len if steps_per_ep is None else steps_per_ep
+        update_info = {}
 
         for t in range(steps_this_ep):
-            a = agent.select_action(o)  # noise (if any) is handled internally
+            # warmup with random actions in [low, high]
+            if total_steps < warmup_steps:
+                a = np.array([np.random.uniform(env.action_low, env.action_high)], dtype=np.float32)
+            else:
+                a = agent.select_action(o, explore=True)
 
-            # env step
             o2, r, done, info = env.step(a)
             ret += r
             starts += int(info["started"])
             on_steps += int(info["on"])
             cap_sum += info["P"]
 
-            # store then (optionally) update
             agent.store((o, a, r, o2, float(done)))
             o = o2
             total_steps += 1
 
-            update_info = {}
             if total_steps >= warmup_steps:
                 update_info = agent.update()
 
@@ -133,13 +133,19 @@ def train(
               f"on_steps={on_steps}/{steps_this_ep} | cap_factor={cap_factor:.2%} | last_update: {update_info}")
 
         if run_dir is not None:
-            eps_rows.append(dict(episode=ep, episode_return=ret, starts=starts, on_steps=on_steps, cap_factor=cap_factor))
+            eps_rows.append(dict(
+                episode=ep,
+                episode_return=ret,
+                starts=starts,
+                on_steps=on_steps,
+                cap_factor=cap_factor
+            ))
 
-        # ---- periodic evaluation (no learning) ----
+        # periodic eval
         if (ep % eval_every) == 0:
             if env_val is not None and eval_val_eps > 0:
                 mret, mcap = _rollout_eval(env_val, agent, eval_val_eps, steps_this_ep)
-                print(f"[EVAL] VAL @ ep {ep}: mean_return={mret:,.0f}, mean_cap_factor={mcap:.2%}")
+                print(f"[EVAL] VAL  @ ep {ep}: mean_return={mret:,.0f}, mean_cap_factor={mcap:.2%}")
                 if eval_writer is not None:
                     eval_writer.writerow([ep, "val", mret, mcap])
 
@@ -154,36 +160,28 @@ def train(
         steps_csv.close()
         eval_csv.close()
 
-    # ---- save aggregated logs/plots/manifests ----
+    # ---- save logs/plots ----
     if run_dir is not None:
-        # episodes.csv
         eps_df = pd.DataFrame(eps_rows)
         eps_df.to_csv(run_dir / "episodes.csv", index=False)
 
-        # plots
         try:
             plt.figure(figsize=(7,5))
             plt.plot(range(1, len(ep_returns)+1), ep_returns, label="Return")
             plt.xlabel("Episode"); plt.ylabel("Profit (€)")
             plt.title("Generator DDPG: episode returns")
-            plt.grid(True, alpha=0.3)
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(run_dir / "ep_returns.png")
-            plt.close()
+            plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
+            plt.savefig(run_dir / "ep_returns.png"); plt.close()
 
             plt.figure(figsize=(7,5))
             plt.plot(eps_df["episode"], eps_df["cap_factor"])
             plt.xlabel("Episode"); plt.ylabel("Capacity factor")
             plt.title("Mean P / Pmax by episode")
-            plt.grid(True, alpha=0.3)
-            plt.tight_layout()
-            plt.savefig(run_dir / "meanP_by_episode.png")
-            plt.close()
+            plt.grid(True, alpha=0.3); plt.tight_layout()
+            plt.savefig(run_dir / "meanP_by_episode.png"); plt.close()
         except Exception as e:
             print("[plot] skipped due to:", e)
 
-        # manifest (augment with optional metadata you passed in)
         manifest = {
             "episodes_csv": str(run_dir / "episodes.csv"),
             "steps_csv": str(run_dir / "steps.csv"),

@@ -128,61 +128,120 @@ class DDPGAgent:
     def update(self) -> Dict[str, float]:
         """
         One DDPG update step (if we have enough samples):
-          1) Sample PER batch + IS weights.
-          2) Critic update (TD regression to target).
-          3) Actor update (deterministic policy gradient).
-          4) Update PER priorities using |TD error|.
-          5) Soft-update targets.
-        Returns a small dict of scalars for logging, or {} if not enough data yet.
+        1) Sample PER batch + IS weights (defensive to Nones / NaNs).
+        2) Critic update (TD regression to target).
+        3) Actor update (deterministic policy gradient).
+        4) Update PER priorities using |TD error|.
+        5) Soft-update targets.
+        Returns scalars for logging, or {} if not enough clean data yet.
         """
+        # Not enough experiences yet
         if len(self.buffer) < self.cfg.batch_size:
             return {}
-        # Anneal beta toward 1.0
+
+        # Anneal importance-sampling beta toward 1.0
         self._beta = min(self.cfg.per_beta_end, self._beta + self._beta_step)
 
-        # Sample PER batch
-        idxs, batch, weights = self.buffer.sample(self.cfg.batch_size, beta=self._beta)
-        obs, act, rew, nxt, done = zip(*batch)
-        obs = tf.convert_to_tensor(np.array(obs), dtype=tf.float32)
-        act = tf.convert_to_tensor(np.array(act), dtype=tf.float32)
-        rew = tf.convert_to_tensor(np.array(rew), dtype=tf.float32)[:, None]
-        nxt = tf.convert_to_tensor(np.array(nxt), dtype=tf.float32)
-        done = tf.convert_to_tensor(np.array(done, dtype=np.float32), dtype=tf.float32)[:, None]
-        w = tf.convert_to_tensor(np.array(weights), dtype=tf.float32)[:, None]
+        # ---- Sample PER batch (defensive) ----
+        try:
+            idxs, batch, weights = self.buffer.sample(self.cfg.batch_size, beta=self._beta)
+        except Exception:
+            return {}
 
-        # Critic update
+        if not batch:
+            return {}
+
+        def _finite(x) -> bool:
+            try:
+                arr = np.asarray(x, dtype=np.float32)
+                return np.isfinite(arr).all()
+            except Exception:
+                return False
+
+        # Build a clean subset aligned across idxs/batch/weights
+        used_idxs, used_w = [], []
+        obs_list, act_list, rew_list, nxt_list, done_list = [], [], [], [], []
+
+        if weights is None:
+            weights = [1.0] * len(batch)
+
+        for idx, tr, w in zip(idxs, batch, weights):
+            if tr is None or not isinstance(tr, (list, tuple)) or len(tr) != 5:
+                continue
+            o, a, r, n, d = tr
+            if (o is None) or (a is None) or (n is None) or (r is None) or (d is None):
+                continue
+            if not (_finite(o) and _finite(a) and _finite(n) and np.isfinite(r) and np.isfinite(d)):
+                continue
+            used_idxs.append(idx)
+            used_w.append(w)
+            obs_list.append(np.asarray(o, dtype=np.float32))
+            # ensure 1D scalar action per transition; will reshape to (B,1) later
+            a = np.asarray(a, dtype=np.float32).reshape(-1)
+            act_list.append(a[0] if a.size > 0 else np.float32(0.0))
+            rew_list.append(np.float32(r))
+            nxt_list.append(np.asarray(n, dtype=np.float32))
+            done_list.append(np.float32(d))
+
+        if len(used_idxs) == 0:
+            return {}
+
+        # ---- To tensors (correct shapes) ----
+        obs  = tf.convert_to_tensor(np.stack(obs_list, axis=0), dtype=tf.float32)          # (B, obs_dim)
+        nxt  = tf.convert_to_tensor(np.stack(nxt_list, axis=0), dtype=tf.float32)          # (B, obs_dim)
+        act  = tf.convert_to_tensor(np.asarray(act_list, dtype=np.float32).reshape(-1, 1)) # (B, 1)
+        rew  = tf.convert_to_tensor(np.asarray(rew_list, dtype=np.float32).reshape(-1, 1)) # (B, 1)
+        done = tf.convert_to_tensor(np.asarray(done_list, dtype=np.float32).reshape(-1, 1))# (B, 1)
+        w    = tf.convert_to_tensor(np.asarray(used_w, dtype=np.float32).reshape(-1, 1))   # (B, 1)
+
+        # ---- Critic update -----------------------------------------------------
         with tf.GradientTape() as tape:
-            nxt_a = self.actor_target(nxt)                                              # μ̄(s')
-            q_target = self.critic_target(nxt, nxt_a) # Q̄(s', μ̄(s'))
-            y = rew + self.cfg.gamma * (1.0 - done) * q_target # TD target
-            y = tf.stop_gradient(y)  # <— add this
-            q = self.critic(obs, act) # Q(s,a)
-            td_error = tf.abs(y - q) # priority proxy
-            huber = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.NONE)
-            per_sample = huber(y, q)          # shape [B,1]
-            critic_loss = tf.reduce_mean(w * per_sample)
+            # Target: y = r + γ (1-d) Q̄(s', μ̄(s'))
+            nxt_a   = self.actor_target(nxt)                         # μ̄(s')
+            q_tgt   = self.critic_target(nxt, nxt_a)                 # Q̄(s', μ̄(s'))
+            y       = rew + self.cfg.gamma * (1.0 - done) * q_tgt
+            y       = tf.stop_gradient(y)
 
-        grads = tape.gradient(critic_loss, self.critic.trainable_variables)
-        grads = [tf.zeros_like(v) if g is None else g for g, v in zip(grads, self.critic.trainable_variables)]
-        grads = [tf.clip_by_norm(g, 1.0) for g in grads]
+            q       = self.critic(obs, act)                          # Q(s, a)
 
+            # PER-weighted Huber loss per sample
+            huber   = tf.keras.losses.Huber(reduction=tf.keras.losses.Reduction.NONE)
+            per_loss= huber(y, q)                                    # (B,1)
+            critic_loss = tf.reduce_mean(w * per_loss)
 
-        # ----- Actor update --------------------------------------------------
+        crit_grads = tape.gradient(critic_loss, self.critic.trainable_variables)
+        crit_grads = [tf.zeros_like(v) if g is None else g
+                    for g, v in zip(crit_grads, self.critic.trainable_variables)]
+        clip_norm = getattr(self.cfg, "grad_clip_norm", 1.0)
+        crit_grads = [tf.clip_by_norm(g, clip_norm) for g in crit_grads]
+        # APPLY (this was missing in your snippet!)
+        self.critic_opt.apply_gradients(zip(crit_grads, self.critic.trainable_variables))
+
+        # ---- Actor update ------------------------------------------------------
         with tf.GradientTape() as tape:
-            a_pred = self.actor(obs) # μ(s)
-            actor_loss = -tf.reduce_mean(self.critic(obs, a_pred)) # maximize Q ≡ minimize -Q
-        grads = tape.gradient(actor_loss, self.actor.trainable_variables)
-        grads = [tf.clip_by_norm(g, 1.0) for g in grads]
-        self.actor_opt.apply_gradients(zip(grads, self.actor.trainable_variables))
+            a_pred = self.actor(obs)                                  # μ(s)
+            actor_loss = -tf.reduce_mean(self.critic(obs, a_pred))    # maximize Q ≡ minimize -Q
+        act_grads = tape.gradient(actor_loss, self.actor.trainable_variables)
+        act_grads = [tf.clip_by_norm(g, clip_norm) for g in act_grads]
+        self.actor_opt.apply_gradients(zip(act_grads, self.actor.trainable_variables))
 
-        # ----- PER priority updates -----------------------------------------
-        # Use |TD error| as priority (add a small epsilon to avoid zeros)
-        self.buffer.update_priorities(idxs, (td_error.numpy().squeeze(-1) + 1e-6))
+        # ---- PER priority updates ---------------------------------------------
+        # Use |TD error| as priority; align with used_idxs only
+        td_error = tf.abs(y - q)                                      # (B,1)
+        td_abs   = td_error.numpy().reshape(-1)
+        eps = getattr(self.cfg, "priority_epsilon", 1e-6)
+        try:
+            self.buffer.update_priorities(used_idxs, (td_abs + eps))
+        except Exception:
+            # Be tolerant if the buffer expects numpy array, etc.
+            self.buffer.update_priorities(list(used_idxs), list(td_abs + eps))
 
-        # Soft update targets
-        self._soft_update(self.actor_target.variables, self.actor.variables, self.cfg.tau)
+        # ---- Soft update targets ----------------------------------------------
+        self._soft_update(self.actor_target.variables,  self.actor.variables,  self.cfg.tau)
         self._soft_update(self.critic_target.variables, self.critic.variables, self.cfg.tau)
 
-        return {"critic_loss": float(critic_loss.numpy()),
-                "actor_loss": float(actor_loss.numpy()),
-                "beta": float(self._beta)}
+        return {
+            "critic_loss": float(critic_loss.numpy()),
+            "actor_loss":  float(actor_loss.numpy()),
+            "beta":        float(self._beta),
+    }

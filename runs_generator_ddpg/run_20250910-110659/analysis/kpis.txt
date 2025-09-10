@@ -1,0 +1,17 @@
+== Generator DDPG run diagnostics ==
+Run dir: runs_generator_ddpg\run_20250910-110659
+Episodes seen in steps.csv: 80
+P_max inferred: 400.000 MW
+dt_hours inferred: 0.500 h
+Total € profit (train log): 56,023,314.46
+Mean € profit per episode: 700,291.43
+Median € profit per episode: 401,455.13
+Mean capacity factor: 80.88%
+Mean starts/episode: 0.55
+Corr(profit, capacity factor):  0.206
+Corr(profit, starts):  0.084
+
+== Heuristic suggestions ==
+- Very high capacity factor on average. If this is unrealistic for your unit, consider:
+  • Increasing start_cost / no_load_cost, tightening min_up/down, or adding small ramp_cost_per_MW.
+- Avg spark spread when running (approx): 47.15 €/MWh
