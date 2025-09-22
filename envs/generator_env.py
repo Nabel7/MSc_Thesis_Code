@@ -17,13 +17,13 @@ class _Box:
 @dataclass
 class PlantParams:
     P_min: float = 50.0
-    P_max: float = 400.0
+    P_max: float = 100.0
     ramp_up: float = 60.0
     ramp_down: float = 60.0
     min_up_steps: int = 8            # was 4
     min_down_steps: int = 8          # was 4
-    start_cost: float = 10_000.0
-    no_load_cost_per_hour: float = 600.0
+    start_cost: float = 100_000.0
+    no_load_cost_per_hour: float = 1000.0
     ramp_cost_per_MW: float = 2.0    # was 0.0 -> penalize dithering
 
 @dataclass
@@ -164,32 +164,43 @@ class ISEMGeneratorEnv:
 
         return self._obs()
 
-    def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, Dict]:
-        # desired setpoint
-        P_cmd = float(np.clip(action[0], self.action_space.low[0], self.action_space.high[0]))
-
-        # ramped setpoint
+    def step(self, action: np.ndarray):
+        """
+        One environment transition.
+        - Action is a scalar (MW command). We clip to [action_low, action_high].
+        - Apply ramp limits.
+        - Commitment logic with min up/down counters and P_min when on.
+        - Compute revenue and costs (variable, no-load, startup, ramp).
+        - Reward = clipped/scaled profit.
+        - Logs var_cost_rate in info for debugging.
+        """
+        # ---------- command & ramp ----------
+        a = float(np.clip(action[0], self.action_space.low[0], self.action_space.high[0]))
+        # ramp window from previous output
         P_ramp_min = max(0.0, self.P_prev - self._ramp_down)
         P_ramp_max = min(self.plant.P_max, self.P_prev + self._ramp_up)
-        P_star = float(np.clip(P_cmd, P_ramp_min, P_ramp_max))
+        P_star = float(np.clip(a, P_ramp_min, P_ramp_max))
 
         started = False
         shut = False
 
-        # commitment logic with min up/down
+        # ---------- commitment with min up/down ----------
         if self.on:
+            # consider shutting only if min-up satisfied and we *really* want to be low
             if self.min_up_counter <= 0 and P_star < 0.5 * self.plant.P_min:
                 self.on = False
                 shut = True
                 self.min_down_counter = self._min_down_steps
                 P = 0.0
             else:
+                # enforce P_min while still inside min-up
                 if self.min_up_counter > 0 and P_star < self.plant.P_min:
                     P = self.plant.P_min
                 else:
-                    P = max(P_star, self.plant.P_min) if self.min_up_counter > 0 else P_star
+                    P = P_star if self.min_up_counter <= 0 else max(P_star, self.plant.P_min)
                 self.min_up_counter = max(0, self.min_up_counter - 1)
         else:
+            # allow start only if min-down satisfied and requested ≥ half of P_min
             if self.min_down_counter <= 0 and P_star >= 0.5 * self.plant.P_min:
                 self.on = True
                 started = True
@@ -199,38 +210,43 @@ class ISEMGeneratorEnv:
                 P = 0.0
                 self.min_down_counter = max(0, self.min_down_counter - 1)
 
+        # ---------- economics ----------
         price = float(self.price[self.t])
-        dt = self.cfg.dt_hours
+        dt = float(self.cfg.dt_hours)
 
-        # --- dynamic or constant variable cost rate ---
-        if self.var_cost_col is not None:
-            var_cost_rate = float(self.df[self.var_cost_col].iloc[self.t])  # €/MWh from CSV
+        # dynamic or constant variable cost rate (€/MWh)
+        if getattr(self, "var_cost_col", None):
+            var_cost_rate = float(self.df[self.var_cost_col].iloc[self.t])
         else:
             var_cost_rate = float(self.costs.variable_cost_per_MWh)
 
-        revenue  = price * P * dt
-        var_cost = var_cost_rate * P * dt
-        no_load  = (self.plant.no_load_cost_per_hour * dt) if self.on and P > 0 else 0.0
-        startup  = self.plant.start_cost if started else 0.0
-        ramp_cost= self.plant.ramp_cost_per_MW * abs(P - self.P_prev)
+        revenue   = price * P * dt
+        var_cost  = var_cost_rate * P * dt
+        no_load   = (self.plant.no_load_cost_per_hour * dt) if (self.on and P > 0.0) else 0.0
+        startup   = float(self.plant.start_cost) if started else 0.0
+        ramp_cost = float(self.plant.ramp_cost_per_MW) * abs(P - self.P_prev)
 
         profit = revenue - var_cost - no_load - startup - ramp_cost
 
+        # ---------- reward (clipped/scaled profit) ----------
+        reward_clip  = getattr(self.cfg, "reward_clip", 1e6)   # safe defaults if not set
+        reward_scale = getattr(self.cfg, "reward_scale", 1.0)
+        reward = float(np.clip(profit, -reward_clip, reward_clip) * reward_scale)
+
+        # ---------- bookkeeping ----------
         info = dict(
-    price=price, P=P, P_cmd=P_cmd, on=int(self.on), started=int(started), shut=int(shut),
-    revenue=revenue, var_cost=var_cost, var_cost_rate=var_cost_rate,  # <--- add this line if you like
-    no_load=no_load, startup=startup, ramp_cost=ramp_cost, profit=profit
-)
-
-
-        profit_clamped = float(np.clip(profit, -self.cfg.reward_clip, self.cfg.reward_clip))
-        reward = profit_clamped * self.cfg.reward_scale
+            price=price, P=P, P_cmd=a, on=int(self.on), started=int(started), shut=int(shut),
+            revenue=revenue, var_cost=var_cost, var_cost_rate=var_cost_rate,
+            no_load=no_load, startup=startup, ramp_cost=ramp_cost, profit=profit
+        )
 
         self.P_prev = P
         self.t += 1
         self.step_in_ep += 1
-        done = self.step_in_ep >= self.cfg.episode_len
-        return self._obs(), float(reward), bool(done), info
+
+        done = bool(self.step_in_ep >= self.cfg.episode_len)
+
+        return self._obs(), reward, done, info
 
     # ---------------- helpers ----------------
     def _obs(self) -> np.ndarray:

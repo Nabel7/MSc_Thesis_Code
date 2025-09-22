@@ -105,6 +105,9 @@ def analyze_run(run_dir: Path):
 
     # Load files
     steps = _safe_read_csv(run_dir / "steps.csv")
+    for c in ["revenue","var_cost","no_load","startup","ramp_cost","P","price"]:
+        if c in steps.columns:
+            steps[c] = pd.to_numeric(steps[c], errors="coerce")
     episodes = _safe_read_csv(run_dir / "episodes.csv")
     evaldf = _safe_read_csv(run_dir / "eval.csv")
     P_max_mani, dt_hours_mani = _get_manifest_numbers(run_dir / "manifest.json")
@@ -297,13 +300,8 @@ def analyze_run(run_dir: Path):
 
             ax2 = ax1.twinx()
             ax2.plot(sdf.index, sdf["price"], alpha=0.7, label="Price (€/MWh)")
-            if "var_cost" in sdf.columns:
-                # recompute var cost rate for this episode for clarity
-                denom = np.maximum(sdf["P"].values * dt_hours, 1e-6)
-                vr = np.where(sdf["P"].values > 1e-6, sdf["var_cost"].values / denom, np.nan)
-                ax2.plot(sdf.index, vr, alpha=0.7, label="Var cost rate (€/MWh)")
-            ax2.set_ylabel("€/MWh")
             ax2.grid(False)
+            ax2.plot(sdf.index, sdf["var_cost"], alpha=0.4, linestyle="--", label="Var cost (€)")
 
             # Show per-step profit as filled bars on the x-axis baseline
             ax1.fill_between(sdf.index, 0, sdf["profit_eur"], step="mid", alpha=0.2, label="step profit")

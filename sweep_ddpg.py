@@ -11,7 +11,7 @@ from train_generator_ddpg import train
 
 # ---------- knobs ----------
 MODE = "joint"   # "env" | "rl" | "joint"
-MAX_RUNS = 60    # safety cap
+MAX_RUNS = 100    # safety cap
 EVAL_EVERY = 10
 EVAL_VAL_EPS = 2
 EVAL_TEST_EPS = 0

@@ -72,27 +72,30 @@ def main():
         "-24", "-48",
         "GasPrice_EUR_per_MWhth",
         "CarbonPrice",
-        "GasVarCost_EUR_per_MWh"   # if you keep constant var cost in the env, drop this to avoid mismatch
+        "GasVarCost_EUR_per_MWh"   
         ]
     feats_train = sanitize_features(TRAIN_CSV, FEATS_WANTED, price_col)
     feats_val   = sanitize_features(VAL_CSV,   FEATS_WANTED, price_col)
     feats_test  = sanitize_features(TEST_CSV,  FEATS_WANTED, price_col)
 
-    # ---- plant & cost (CCGT-ish) ----
+    # ---- scenario: HIGH_TIGHT / EXPENSIVE ----
     plant = PlantParams(
-        P_min=50.0, P_max=400.0,
-        ramp_up=60.0, ramp_down=60.0,   # MW per 30-min step
-        min_up_steps=4, min_down_steps=4,
-        start_cost=10_000.0,
-        no_load_cost_per_hour=600.0,
-        ramp_cost_per_MW=0.0,
+        P_min=100.0, P_max=500.0,
+        ramp_up=20.0, ramp_down=20.0,     # MW per 1h step; if dt_hours=0.5 → 10 MW per step
+        min_up_steps=16, min_down_steps=16,# 8h each if dt_hours=0.5
+        start_cost=50_000.0,              # € per start
+        no_load_cost_per_hour=1_200.0,    # €/h when on
+        ramp_cost_per_MW=2.0,             # €/MW change (linear)
     )
-    costs = CostParams(variable_cost_per_MWh=40.0)
+    costs = CostParams(
+        variable_cost_per_MWh=120.0       # €/MWh (fuel+CO₂ shock)
+    )
+
 
     # IMPORTANT: we will compute our own normalization stats
     cfg = EnvConfig(
-        dt_hours=0.5,
-        episode_len=96,
+        dt_hours=1,
+        episode_len=48,
         normalize_features=False,     # <- off so we can control stats
         add_time_features=True,
         time_col="DeliveryPeriod",
@@ -153,7 +156,7 @@ def main():
     agent, ep_returns = train(
         env=env_train,
         episodes=80,
-        steps_per_ep=96,
+        steps_per_ep=48,
         cfg=ddpg_cfg,
         warmup_steps=1_000,
         log_dir=BASE / "runs_generator_ddpg",

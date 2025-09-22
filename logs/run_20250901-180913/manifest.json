@@ -1,0 +1,78 @@
+{
+  "run_id": "20250901-180913",
+  "timestamp": "2025-09-01 18:11:05",
+  "python": "3.11.9",
+  "platform": "Windows-10-10.0.19045-SP0",
+  "tensorflow": "2.13.1",
+  "seed": 0,
+  "data": {
+    "train_csv": "F:\\MSc_Thesis\\MSc_Thesis_Code\\data\\speculator_train.csv",
+    "train_sha256_12": "8e9138f6bed6",
+    "val_csv": "F:\\MSc_Thesis\\MSc_Thesis_Code\\data\\speculator_val.csv",
+    "val_sha256_12": "3fc73d421780",
+    "test_csv": "F:\\MSc_Thesis\\MSc_Thesis_Code\\data\\speculator_test.csv",
+    "test_sha256_12": "2cfedc0610b8",
+    "train_range": [
+      "2019-04-09 23:00:00",
+      "2021-11-18 05:00:00"
+    ],
+    "train_rows": 22873,
+    "val_range": [
+      "2021-11-18 06:00:00",
+      "2022-06-10 13:00:00"
+    ],
+    "val_rows": 4901,
+    "test_range": [
+      "2022-06-10 14:00:00",
+      "2022-12-31 23:00:00"
+    ],
+    "test_rows": 4902,
+    "features": [
+      "WindAggregatedForecast",
+      "DemandAggregatedForecast",
+      "-24",
+      "-48"
+    ],
+    "add_time_features": true,
+    "exclude_years": [
+      2023
+    ],
+    "norm_stats_from": "TRAIN_ONLY"
+  },
+  "env": {
+    "use_delta_actions": true,
+    "delta_max": 30.0,
+    "ref_price_col": "-24",
+    "per_mwh_fee": 0.5,
+    "fixed_fee": 0.0,
+    "delta_reg": 0.0,
+    "reward_scale": 0.01,
+    "episode_len": 96
+  },
+  "agent": {
+    "num_bins": 11,
+    "delta_max": 30.0,
+    "gamma": 0.99,
+    "lr": 0.001,
+    "batch_size": 128,
+    "buffer_size": 100000,
+    "per_alpha": 0.6,
+    "per_beta_start": 0.4,
+    "per_beta_end": 1.0,
+    "per_beta_steps": 2500,
+    "dueling": true,
+    "double": true,
+    "tau": 0.005,
+    "eps_start": 1.0,
+    "eps_end": 0.05,
+    "eps_decay_steps": 2500,
+    "seed": 0
+  },
+  "training": {
+    "episodes": 30,
+    "steps_per_ep": 96,
+    "warmup_steps": 2000,
+    "batch_size": 128,
+    "buffer_size": 100000
+  }
+}

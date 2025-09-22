@@ -145,8 +145,8 @@ cfg = DQNConfig(
 # ---------- train ----------
 logger = CSVLogger(episode_csv=str(EP_CSV), step_csv=str(ST_CSV))
 agent, returns = train(env_train=env_train, env_val=env_val,
-                       episodes=400, steps_per_ep=96,
-                       cfg=cfg, warmup_steps=4000,
+                       episodes=100, steps_per_ep=48,
+                       cfg=cfg, warmup_steps=1000,
                        logger=logger, run_id=RUN_ID)
 print("TRAIN returns:", returns)
 
